@@ -1,0 +1,740 @@
+--- /dev/null
++++ b/arch/mips/bcm63xx/boards/board_bthomehubv1.c
+@@ -0,0 +1,513 @@
++/**
++ * This file is subject to the terms and conditions of the GNU General Public
++ * License.  See the file "COPYING" in the main directory of this archive
++ * for more details.
++ *
++ * board_homehubv1.c
++ * Mostly cut 'n' shut from board_bcm963xx.c (Copyright (C) 2008 Florian Fainelli <florian@openwrt.org>)
++ * Use of this software requires you to replace the standard BT HomeHub loader with Ecos Redboot,
++ * see http://psidoc.com for details.
++ * It WILL NOT work with the standard BT/Thomson/Speedtouch bootloader.
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/string.h>
++#include <linux/platform_device.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++#include <linux/mtd/physmap.h>
++#include <linux/ssb/ssb.h>
++#include <linux/gpio_buttons.h>
++#include <linux/input.h>
++#include <linux/spi/spi.h>
++#include <linux/spi/spi_gpio.h>
++#include <linux/spi/74x164.h>
++#include <asm/addrspace.h>
++#include <bcm63xx_board.h>
++#include <bcm63xx_cpu.h>
++#include <bcm63xx_dev_uart.h>
++#include <bcm63xx_regs.h>
++#include <bcm63xx_io.h>
++#include <bcm63xx_dev_pci.h>
++#include <bcm63xx_dev_enet.h>
++#include <bcm63xx_dev_dsp.h>
++#include <bcm63xx_dev_pcmcia.h>
++#include <bcm63xx_dev_usb_ohci.h>
++#include <bcm63xx_dev_usb_ehci.h>
++#include <bcm63xx_dev_spi.h>
++#include <board_bcm963xx.h>
++#include <bcm_tag.h>
++
++#define PFX	"board_homehub: "
++
++/** GPIO stuff
++ * ************* V1 **********************************
++ *
++ * GPIO_00-GPIO_04 : GREEN_LED_00->GREEN_LED_04 : OUT
++ * GPIO_05 : ? (unused)
++ * GPIO_06 : AC101L_RST_N : OUT
++ * GPIO_07 : ? (unused)
++ * GPIO_08-GPIO_15 : MII BLK : IN
++ * GPIO_16-GPIO_27 : PCI PCCARD BLK : IN
++ * GPIO_28 : PCD80705_RSTN : IN (out=reset)
++ * GPIO_29-GPIO_31 : ? (unused)
++ * GPIO_32 : MII BLK : IN
++ * GPIO_33 : PCD80705_INT : IN
++ * GPIO_34 : CHARGER COM : OUT (0 charge, 1 serial)
++ * GPIO_35 : ? (unused)
++ * GPIO_36 : BUTTON : IN
++ *
++ ************** V1.5 ********************************
++ *
++ * GPIO_00-GPIO_04 : GREEN_LED_00->GREEN_LED_04 : OUT
++ * GPIO_05 : RED_LED_00 : OUT
++ * GPIO_06 : AC101L_RST_N : OUT
++ * GPIO_07 : RED_LED_02 : OUT
++ * GPIO_08-GPIO_15 : MII BLK : IN
++ * GPIO_16-GPIO_21 : ? (unused)
++ * GPIO_22 : RED_LED_01 : OUT
++ * GPIO_23-GPIO_27 : ? (unused)
++ * GPIO_28 : PCD80705_RSTN : IN (out=reset)
++ * GPIO_29 : RED_LED_03 : OUT
++ * GPIO_31 : RED_LED_04 : OUT
++ * GPIO_32 : MII BLK : IN
++ * GPIO_33 : PCD80705_INT : IN
++ * GPIO_34 : CHARGER COM : OUT (0 charge, 1 serial)
++ * GPIO_35 : BUTTON : IN
++ * GPIO_36 : BUTTON : IN
++ *
++ *****************************************************/
++
++
++static unsigned int mac_addr_used = 0;
++static struct board_info board;
++
++static struct spi_board_info hub_spi_devices[] = {
++    {
++        .modalias = "spidev",
++        .max_speed_hz = 20000,
++        .bus_num = 0,
++        .chip_select = 0,
++        .mode = SPI_MODE_0,
++    },
++};
++/**
++ * Since there is no way that i know of to detect the difference between
++ * V1 and V1.5, make sure to select the right one in the kernel .config.
++ */
++static struct board_info __initdata board_homehub = {
++#ifdef CONFIG_BOARD_BTHOMEHUBV1
++	.name				= "HomeHubV1",
++#else
++	.name				= "HomeHubV1.5",
++#endif
++	.expected_cpu_id		= 0x6348,
++	.has_uart0			= 1,
++	.has_enet0			= 1,
++	.has_enet1			= 1,
++	.has_pci			= 1,
++
++	.enet0 = {
++		.has_phy		= 1,
++		.use_internal_phy	= 1,
++	},
++
++	.enet1 = {
++		.has_phy		= 1,
++		.phy_id 		= 31,
++	},
++
++	.has_ohci0			= 1,
++
++/*
++ * Apparently dsp is not working for this platform.
++ */
++/*	.has_dsp			= 1,
++	.dsp = {
++		.gpio_rst		= 6,
++		.gpio_int		= 33,
++		.cs			= 0,
++		.ext_irq		= 2,
++	},
++*/
++#ifdef CONFIG_BOARD_BTHOMEHUBV1
++	//.has_pccard			= 1,	// If you fancy soldering a pccard header on. only works properly
++						// for V1 as gpio 22 is used by pccard whereas its used for
++						// led red:2 on the V1.5
++	.leds = {
++		/* I don't know if this is right, All are green. */
++		{
++			.name		= "green:1",
++			.gpio		= 0,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:2",
++			.gpio		= 1,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:3",
++			.gpio		= 2,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:4",
++			.gpio		= 3,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:5",
++			.gpio		= 4,
++			.active_low	= 0,
++		},
++	},
++#else
++	.leds = {
++		{
++			.name		= "green:1",
++			.gpio		= 0,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:2",
++			.gpio		= 1,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:3",
++			.gpio		= 2,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:4",
++			.gpio		= 3,
++			.active_low	= 0,
++		},
++		{
++			.name		= "green:5",
++			.gpio		= 4,
++			.active_low	= 0,
++		},
++		{
++			.name		= "red:1",
++			.gpio		= 5,
++			.active_low	= 0,
++			.default_trigger = "heartbeat" // so we know we're alive through boot
++		},
++		{
++			.name		= "red:2",
++			.gpio		= 22,
++			.active_low	= 0,
++		},
++		{
++			.name		= "red:3",
++			.gpio		= 7,
++			.active_low	= 0,
++		},
++		{
++			.name		= "red:4",
++			.gpio		= 29,
++			.active_low	= 0,
++		},
++		{
++			.name		= "red:5",
++			.gpio		= 30,
++			.active_low	= 0,
++		},
++	},
++#endif
++
++#ifdef CONFIG_BOARD_BTHOMEHUBV1
++	/* V1 only has one button that is supposed to be wps -> DECT associate -> reset */
++	.buttons = {
++		{
++			.desc		= "BTN_1",
++			.gpio		= 36,		// FIXME wild guess!
++			.type		= EV_KEY,
++			.code		= BTN_1,
++			.threshold	= 3,
++		},
++	},
++#else
++	/* The third button is a hardware reset, we don't need to know about it. */
++	.buttons = {
++		{
++			.desc		= "BTN_2", // red reset
++			.gpio		= 35,
++			.type		= EV_KEY,
++			.code		= BTN_2,
++			.threshold	= 3,
++		},
++		{
++			.desc		= "BTN_1", // top associate
++			.gpio		= 36,
++			.type		= EV_KEY,
++			.code		= BTN_1,
++			.threshold	= 3,
++		},
++	},
++#endif
++/** FIXME: More Hub spi stuff. */
++	//.devs = hub_spi_devices,
++	//.num_devs = ARRAY_SIZE(hub_spi_devices),
++	.spis = hub_spi_devices,
++	.num_spis = ARRAY_SIZE(hub_spi_devices),
++};
++
++static const struct board_info __initdata *bcm963xx_boards[] = {
++	&board_homehub
++};
++
++/* Enable icache & dcache*/
++static void __cpuinit enable_idcache(void)
++{
++    printk("enabling icache and dcache\n");
++    write_c0_diag(read_c0_diag() | 0xC0000000);
++}
++
++/*
++ * register & return a new board mac address
++ */
++static int board_get_mac_address(u8 *mac)
++{
++	u8 default_mac[ETH_ALEN] = {0x00, 0x07, 0x3A, 0xFF, 0xFF, 0xFF};
++	u8 *p;
++	int count;
++
++	memcpy(mac, default_mac, ETH_ALEN);
++
++	p = mac + ETH_ALEN - 1;
++	count = mac_addr_used;
++
++	while (count--) {
++		do {
++			(*p)++;
++			if (*p != 0)
++				break;
++			p--;
++		} while (p != mac);
++	}
++
++	if (p == mac) {
++		printk(KERN_ERR PFX "unable to fetch mac address\n");
++		return -ENODEV;
++	}
++        mac_addr_used++;
++
++	return 0;
++}
++
++struct ssb_sprom bcm63xx_sprom = {
++	.revision		= 0x02,
++	.board_rev		= 0x17,
++	.country_code		= 0x0,
++	.ant_available_bg 	= 0x0,
++	.pa0b0			= 0x1612,
++	.pa0b1			= 0xfaec,
++	.pa0b2			= 0xfeac,
++	.pa1b0			= 0xffff,
++	.pa1b1			= 0xffff,
++	.pa1b2			= 0xffff,
++	.gpio0			= 0xff,
++	.gpio1			= 0xff,
++	.gpio2			= 0xff,
++	.gpio3			= 0xff,
++	.maxpwr_bg		= 0x50, // check this, might be 0x4c
++	.itssi_bg		= 0x00,
++	.boardflags_lo		= 0xf249,
++	.boardflags_hi		= 0x0000,
++};
++EXPORT_SYMBOL(bcm63xx_sprom);
++
++int bcm63xx_get_fallback_sprom(struct ssb_bus *bus, struct ssb_sprom *out)
++{
++	if (bus->bustype == SSB_BUSTYPE_PCI) {
++		memcpy(out, &bcm63xx_sprom, sizeof(struct ssb_sprom));
++		return 0;
++	} else {
++		printk(KERN_ERR PFX "unable to fill SPROM for given bustype.\n");
++		return -EINVAL;
++	}
++}
++
++void __init board_prom_init(void)
++{
++	u32 val;
++
++	/* assume board is HomeHub */
++	memcpy(&board, bcm963xx_boards[0], sizeof(board));
++	enable_idcache();
++	val = 0;
++
++	if (board.has_pci) {
++		bcm63xx_pci_enabled = 1;
++		if (BCMCPU_IS_6348())
++			val |= GPIO_MODE_6348_G2_PCI;
++	}
++
++	if (board.has_pccard) {
++		if (BCMCPU_IS_6348())
++			val |= GPIO_MODE_6348_G1_MII_PCCARD;
++	}
++
++	if (board.has_enet0 && !board.enet0.use_internal_phy) {
++		if (BCMCPU_IS_6348())
++			val |= GPIO_MODE_6348_G3_EXT_MII |
++				GPIO_MODE_6348_G0_EXT_MII;
++	}
++
++	if (board.has_enet1 && !board.enet1.use_internal_phy) {
++		if (BCMCPU_IS_6348())
++			val |= GPIO_MODE_6348_G3_EXT_MII |
++				GPIO_MODE_6348_G0_EXT_MII;
++			/* Enable some devices */
++			printk("enabling eth1, dsp\n");
++			gpio_request(6, "dsp_eth_rst");
++			gpio_direction_output(6, 0);
++			gpio_set_value(6, 1);
++	}
++
++	bcm_gpio_writel(val, GPIO_MODE_REG);
++
++	if (!board_get_mac_address(bcm63xx_sprom.il0mac)) {
++		memcpy(bcm63xx_sprom.et0mac, bcm63xx_sprom.il0mac, ETH_ALEN);
++		memcpy(bcm63xx_sprom.et1mac, bcm63xx_sprom.il0mac, ETH_ALEN);
++		if (ssb_arch_register_fallback_sprom(
++				&bcm63xx_get_fallback_sprom) < 0)
++			printk(KERN_ERR PFX "failed to register fallback SPROM\n");
++	}
++}
++
++/**
++ * second stage init callback, good time to panic if we couldn't
++ * identify on which board we're running since early printk is working
++ */
++void __init board_setup(void)
++{
++	/* make sure we're running on expected cpu */
++	if (bcm63xx_get_cpu_id() != board.expected_cpu_id)
++#ifdef CONFIG_BOARD_BTHOMEHUBV1
++		panic("unexpected CPU for BT HomeHub V1");
++#else
++		panic("unexpected CPU for BT HomeHub V1.5");
++#endif
++}
++
++/*
++ * return board name for /proc/cpuinfo
++ */
++const char *board_get_name(void)
++{
++	return board.name;
++}
++
++static struct resource mtd_resources[] = {
++	{
++		.start          = 0,
++		.end            = 0,
++		.flags          = IORESOURCE_MEM,
++	}
++};
++
++static struct platform_device mtd_dev = {
++	.name                   = "bcm963xx-flash",
++	.resource               = mtd_resources,
++	.num_resources          = ARRAY_SIZE(mtd_resources),
++};
++
++static struct resource gpiodev_resource = {
++	.start			= 0xFFFFFFFF,
++};
++
++static struct gpio_led_platform_data bcm63xx_led_data;
++
++static struct platform_device bcm63xx_gpio_leds = {
++	.name			= "leds-gpio",
++	.id			= 0,
++	.dev.platform_data	= &bcm63xx_led_data,
++};
++
++static struct gpio_buttons_platform_data bcm63xx_gpio_buttons_data = {
++	.poll_interval  = 20,
++};
++
++static struct platform_device bcm63xx_gpio_buttons_device = {
++	.name			= "gpio-buttons",
++	.id			= 0,
++	.dev.platform_data = &bcm63xx_gpio_buttons_data,
++};
++
++/**
++ * third stage init callback, register all board devices.
++ */
++int __init board_register_devices(void)
++{
++	int button_count = 0;
++	int led_count = 0;
++
++	if (board.has_uart0)
++		bcm63xx_uart_register(0);
++
++	if (board.has_uart1)
++		bcm63xx_uart_register(1);
++
++	if (board.has_pccard)
++		bcm63xx_pcmcia_register();
++
++	if (board.has_enet0 &&
++	    !board_get_mac_address(board.enet0.mac_addr))
++		bcm63xx_enet_register(0, &board.enet0);
++
++	if (board.has_enet1 &&
++	    !board_get_mac_address(board.enet1.mac_addr))
++		bcm63xx_enet_register(1, &board.enet1);
++
++	if (board.has_ehci0)
++		bcm63xx_ehci_register();
++
++	if (board.has_ohci0)
++		bcm63xx_ohci_register();
++
++	if (board.has_dsp)
++		bcm63xx_dsp_register(&board.dsp);
++
++	if (board.num_devs)
++		platform_add_devices(board.devs, board.num_devs);
++
++	if (board.num_spis)
++		spi_register_board_info(board.spis, board.num_spis);
++
++	bcm63xx_spi_register();
++
++	/* hardcode this for HomeHub */
++	mtd_resources[0].start = 0x1FC00000;
++	mtd_resources[0].end = 0x1FFFFFFF;
++
++	platform_device_register(&mtd_dev);
++
++	platform_device_register_simple("GPIODEV", 0, &gpiodev_resource, 1);
++
++	while (led_count < ARRAY_SIZE(board.leds) && board.leds[led_count].name)
++	  led_count++;
++
++	bcm63xx_led_data.num_leds = led_count;
++	bcm63xx_led_data.leds = board.leds;
++
++	platform_device_register(&bcm63xx_gpio_leds);
++
++	while (button_count < ARRAY_SIZE(board.buttons) && board.buttons[button_count].desc)
++		button_count++;
++
++	if (button_count) {
++		bcm63xx_gpio_buttons_data.nbuttons = button_count;
++		bcm63xx_gpio_buttons_data.buttons = board.buttons;
++
++		platform_device_register(&bcm63xx_gpio_buttons_device);
++	}
++	return 0;
++}
++
++
++
+--- a/arch/mips/bcm63xx/boards/Makefile
++++ b/arch/mips/bcm63xx/boards/Makefile
+@@ -1,4 +1,6 @@
+ obj-$(CONFIG_BOARD_BCM963XX)		+= board_bcm963xx.o
+ obj-$(CONFIG_BOARD_LIVEBOX)		+= board_livebox.o
++obj-$(CONFIG_BOARD_BTHOMEHUBV1)		+= board_bthomehubv1.o
++obj-$(CONFIG_BOARD_BTHOMEHUBV15)		+= board_bthomehubv1.o
+ 
+-ccflags-y := -Werror
++EXTRA_CFLAGS += -Werror
+--- a/arch/mips/bcm63xx/boards/Kconfig
++++ b/arch/mips/bcm63xx/boards/Kconfig
+@@ -14,4 +14,16 @@ config BOARD_LIVEBOX
+ 	help
+ 	 Inventel Livebox boards using the RedBoot bootloader.
+ 
++config BOARD_BTHOMEHUBV1
++	bool "BT HomeHub V1"
++	select SSB
++	help
++	 BT Homehub V1 using RedBoot bootloader.
++
++config BOARD_BTHOMEHUBV15
++	bool "BT HomeHub V1.5"
++	select SSB
++	help
++	 BT Homehub V1.5 using RedBoot bootloader.
++
+ endchoice
+--- a/drivers/mtd/mtdblock.c
++++ b/drivers/mtd/mtdblock.c
+@@ -32,7 +32,7 @@
+ #include <linux/mtd/mtd.h>
+ #include <linux/mtd/blktrans.h>
+ #include <linux/mutex.h>
+-
++#include <gpio.h>
+ 
+ struct mtdblk_dev {
+ 	struct mtd_blktrans_dev mbd;
+@@ -143,6 +143,10 @@ static int write_cached_data (struct mtd
+ static int do_cached_write (struct mtdblk_dev *mtdblk, unsigned long pos,
+ 			    int len, const char *buf)
+ {
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_direction_output(30, 0);
++	gpio_set_value(30, 1);
++#endif*/
+ 	struct mtd_info *mtd = mtdblk->mbd.mtd;
+ 	unsigned int sect_size = mtdblk->cache_size;
+ 	size_t retlen;
+@@ -205,7 +209,9 @@ static int do_cached_write (struct mtdbl
+ 		pos += size;
+ 		len -= size;
+ 	}
+-
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_set_value(30, 0);
++#endif*/
+ 	return 0;
+ }
+ 
+@@ -213,6 +219,10 @@ static int do_cached_write (struct mtdbl
+ static int do_cached_read (struct mtdblk_dev *mtdblk, unsigned long pos,
+ 			   int len, char *buf)
+ {
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_direction_output(4, 0);
++	gpio_set_value(4, 1);
++#endif*/
+ 	struct mtd_info *mtd = mtdblk->mbd.mtd;
+ 	unsigned int sect_size = mtdblk->cache_size;
+ 	size_t retlen;
+@@ -252,7 +262,9 @@ static int do_cached_read (struct mtdblk
+ 		pos += size;
+ 		len -= size;
+ 	}
+-
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_set_value(4, 0);
++#endif*/
+ 	return 0;
+ }
+ 
+--- a/fs/jffs2/read.c
++++ b/fs/jffs2/read.c
+@@ -17,11 +17,16 @@
+ #include <linux/compiler.h>
+ #include "nodelist.h"
+ #include "compr.h"
++#include <gpio.h>
+ 
+ int jffs2_read_dnode(struct jffs2_sb_info *c, struct jffs2_inode_info *f,
+ 		     struct jffs2_full_dnode *fd, unsigned char *buf,
+ 		     int ofs, int len)
+ {
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_direction_output(4, 0);
++	gpio_set_value(4, 1);
++#endif*/
+ 	struct jffs2_raw_inode *ri;
+ 	size_t readlen;
+ 	uint32_t crc;
+@@ -146,13 +151,19 @@ int jffs2_read_dnode(struct jffs2_sb_inf
+ 		kfree(readbuf);
+  out_ri:
+ 	jffs2_free_raw_inode(ri);
+-
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_set_value(4, 0);
++#endif*/
+ 	return ret;
+ }
+ 
+ int jffs2_read_inode_range(struct jffs2_sb_info *c, struct jffs2_inode_info *f,
+ 			   unsigned char *buf, uint32_t offset, uint32_t len)
+ {
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_direction_output(4, 0);
++	gpio_set_value(4, 1);
++#endif*/
+ 	uint32_t end = offset + len;
+ 	struct jffs2_node_frag *frag;
+ 	int ret;
+@@ -211,6 +222,9 @@ int jffs2_read_inode_range(struct jffs2_
+ 			D2(printk(KERN_DEBUG "node read was OK. Looping\n"));
+ 		}
+ 	}
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_set_value(4, 0);
++#endif*/
+ 	return 0;
+ }
+ 
+--- a/fs/jffs2/writev.c
++++ b/fs/jffs2/writev.c
+@@ -12,6 +12,7 @@
+ #include <linux/kernel.h>
+ #include <linux/mtd/mtd.h>
+ #include "nodelist.h"
++#include <gpio.h>
+ 
+ /* This ought to be in core MTD code. All registered MTD devices
+    without writev should have this put in place. Bug the MTD
+@@ -40,6 +41,10 @@ static inline int mtd_fake_writev(struct
+ int jffs2_flash_direct_writev(struct jffs2_sb_info *c, const struct kvec *vecs,
+ 			      unsigned long count, loff_t to, size_t *retlen)
+ {
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_direction_output(30, 0);
++	gpio_set_value(30, 1);
++#endif*/
+ 	if (!jffs2_is_writebuffered(c)) {
+ 		if (jffs2_sum_active()) {
+ 			int res;
+@@ -49,7 +54,9 @@ int jffs2_flash_direct_writev(struct jff
+ 			}
+ 		}
+ 	}
+-
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_set_value(30, 0);
++#endif*/
+	return mtd_writev(c->mtd, vecs, count, to, retlen);
+}
+
+@@ -60,6 +67,10 @@ int jffs2_flash_direct_writev(struct jff
+ int jffs2_flash_direct_write(struct jffs2_sb_info *c, loff_t ofs, size_t len,
+ 			size_t *retlen, const u_char *buf)
+ {
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_direction_output(30, 0);
++	gpio_set_value(30, 1);
++#endif*/
+ 	int ret;
+ 	ret = c->mtd->write(c->mtd, ofs, len, retlen, buf);
+ 
+@@ -75,5 +86,8 @@ int jffs2_flash_direct_write(struct jffs
+ 			return res;
+ 		}
+ 	}
++/*#if defined CONFIG_BOARD_BTHOMEHUBV15
++	gpio_set_value(30, 0);
++#endif*/
+ 	return ret;
+ }
+--- a/drivers/mtd/maps/bcm963xx-flash.c
++++ b/drivers/mtd/maps/bcm963xx-flash.c
+@@ -33,8 +33,11 @@
+ #include <asm/mach-bcm63xx/bcm963xx_tag.h>
+ 
+ #define BCM63XX_BUSWIDTH	2		/* Buswidth */
++#if defined CONFIG_BOARD_BTHOMEHUBV1 || CONFIG_BOARD_BTHOMEHUBV15
++#define BCM63XX_EXTENDED_SIZE	0xBE400000	/* Extended flash for home hub */
++#else
+ #define BCM63XX_EXTENDED_SIZE	0xBFC00000	/* Extended flash address */
+-
++#endif
+ #define PFX KBUILD_MODNAME ": "
+ 
+ struct squashfs_super_block {
+@@ -192,7 +195,11 @@ static int bcm963xx_probe(struct platfor
+ 	}
+ 
+ 	bcm963xx_map.phys = r->start;
++#if defined CONFIG_BOARD_BTHOMEHUBV1 || CONFIG_BOARD_BTHOMEHUBV15
++	bcm963xx_map.size = 0x00800000;
++#else
+ 	bcm963xx_map.size = resource_size(r);
++#endif
+ 	bcm963xx_map.virt = ioremap(r->start, resource_size(r));
+ 	if (!bcm963xx_map.virt) {
+ 		dev_err(&pdev->dev, "failed to ioremap\n");
+@@ -232,8 +239,9 @@ probe_ok:
+ 	} else {
+ 		printk(KERN_INFO PFX "assuming RedBoot bootloader\n");
+ 		if (bcm963xx_mtd_info->size > 0x00400000) {
+-			printk(KERN_INFO PFX "Support for extended flash memory size : 0x%lx ; ONLY 64MBIT SUPPORT\n", bcm963xx_mtd_info->size);
+ 			bcm963xx_map.virt = (u32)(BCM63XX_EXTENDED_SIZE);
++			printk(KERN_INFO PFX "Support extended flash 0x%08lx at 0x%08x\n",
++							bcm963xx_map.size, bcm963xx_map.virt);
+ 		}
+ 
+ #ifdef CONFIG_MTD_REDBOOT_PARTS
