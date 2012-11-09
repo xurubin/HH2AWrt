@@ -677,9 +677,9 @@
 +/*#if defined CONFIG_BOARD_BTHOMEHUBV15
 +	gpio_set_value(30, 0);
 +#endif*/
-	return mtd_writev(c->mtd, vecs, count, to, retlen);
-}
-
+ 	return mtd_writev(c->mtd, vecs, count, to, retlen);
+ }
+ 
 @@ -60,6 +67,10 @@ int jffs2_flash_direct_writev(struct jff
  int jffs2_flash_direct_write(struct jffs2_sb_info *c, loff_t ofs, size_t len,
  			size_t *retlen, const u_char *buf)
@@ -700,41 +700,3 @@
 +#endif*/
  	return ret;
  }
---- a/drivers/mtd/maps/bcm963xx-flash.c
-+++ b/drivers/mtd/maps/bcm963xx-flash.c
-@@ -33,8 +33,11 @@
- #include <asm/mach-bcm63xx/bcm963xx_tag.h>
- 
- #define BCM63XX_BUSWIDTH	2		/* Buswidth */
-+#if defined CONFIG_BOARD_BTHOMEHUBV1 || CONFIG_BOARD_BTHOMEHUBV15
-+#define BCM63XX_EXTENDED_SIZE	0xBE400000	/* Extended flash for home hub */
-+#else
- #define BCM63XX_EXTENDED_SIZE	0xBFC00000	/* Extended flash address */
--
-+#endif
- #define PFX KBUILD_MODNAME ": "
- 
- struct squashfs_super_block {
-@@ -192,7 +195,11 @@ static int bcm963xx_probe(struct platfor
- 	}
- 
- 	bcm963xx_map.phys = r->start;
-+#if defined CONFIG_BOARD_BTHOMEHUBV1 || CONFIG_BOARD_BTHOMEHUBV15
-+	bcm963xx_map.size = 0x00800000;
-+#else
- 	bcm963xx_map.size = resource_size(r);
-+#endif
- 	bcm963xx_map.virt = ioremap(r->start, resource_size(r));
- 	if (!bcm963xx_map.virt) {
- 		dev_err(&pdev->dev, "failed to ioremap\n");
-@@ -232,8 +239,9 @@ probe_ok:
- 	} else {
- 		printk(KERN_INFO PFX "assuming RedBoot bootloader\n");
- 		if (bcm963xx_mtd_info->size > 0x00400000) {
--			printk(KERN_INFO PFX "Support for extended flash memory size : 0x%lx ; ONLY 64MBIT SUPPORT\n", bcm963xx_mtd_info->size);
- 			bcm963xx_map.virt = (u32)(BCM63XX_EXTENDED_SIZE);
-+			printk(KERN_INFO PFX "Support extended flash 0x%08lx at 0x%08x\n",
-+							bcm963xx_map.size, bcm963xx_map.virt);
- 		}
- 
- #ifdef CONFIG_MTD_REDBOOT_PARTS
