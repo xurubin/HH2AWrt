@@ -1,0 +1,16 @@
+--- a/drivers/mtd/bcm63xxpart.c
++++ b/drivers/mtd/bcm63xxpart.c
+@@ -36,7 +36,13 @@
+ #include <asm/mach-bcm63xx/bcm963xx_tag.h>
+ #include <asm/mach-bcm63xx/board_bcm963xx.h>
+ 
++#if defined CONFIG_BOARD_BTHOMEHUBV1 || CONFIG_BOARD_BTHOMEHUBV15
++#define BCM63XX_EXTENDED_SIZE 0xBE400000      /* Extended flash for home hub */
++#elif defined CONFIG_BOARD_BTHOMEHUBV20A
++#define BCM63XX_EXTENDED_SIZE 0xBE000000      /* Extended flash for home hub 2 */
++#else
+ #define BCM63XX_EXTENDED_SIZE	0xBFC00000	/* Extended flash address */
++#endif
+ 
+ #define BCM63XX_CFE_BLOCK_SIZE	0x10000		/* always at least 64KiB */
+ 
