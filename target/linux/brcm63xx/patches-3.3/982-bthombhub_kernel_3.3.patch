@@ -14,3 +14,70 @@
  
  #define BCM63XX_CFE_BLOCK_SIZE	0x10000		/* always at least 64KiB */
  
+--- a/arch/mips/bcm63xx/boards/board_bthomehubv2A.c
++++ b/arch/mips/bcm63xx/boards/board_bthomehubv2A.c
+@@ -280,7 +280,7 @@ struct ssb_sprom bcm63xx_sprom = {
+ 	.boardflags_lo		= 0xf249,
+ 	.boardflags_hi		= 0x0000,
+ };
+-EXPORT_SYMBOL(bcm63xx_sprom);
++//EXPORT_SYMBOL(bcm63xx_sprom);
+ 
+ int bcm63xx_get_fallback_sprom(struct ssb_bus *bus, struct ssb_sprom *out)
+ {
+--- a/arch/mips/include/asm/mach-bcm63xx/board_bcm963xx.h
++++ b/arch/mips/include/asm/mach-bcm63xx/board_bcm963xx.h
+@@ -3,7 +3,11 @@
+ 
+ #include <linux/types.h>
+ #include <linux/gpio.h>
++#ifdef CONFIG_BOARD_BTHOMEHUBV20A
++#include <linux/gpio_buttons.h>
++#else
+ #include <linux/gpio_keys.h>
++#endif
+ #include <linux/leds.h>
+ #include <bcm63xx_dev_enet.h>
+ #include <bcm63xx_dev_dsp.h>
+@@ -55,8 +59,11 @@ struct board_info {
+ 	struct gpio_led leds[16];
+ 
+ 	/* Buttons */
++#ifdef CONFIG_BOARD_BTHOMEHUBV20A
++	struct gpio_button buttons[4];
++#else
+ 	struct gpio_keys_button buttons[4];
+-
++#endif
+ 	/* Additional platform devices */
+ 	struct platform_device **devs;
+ 	unsigned int	num_devs;
+--- a/drivers/gpio/gpio-74x594.c
++++ b/drivers/gpio/gpio-74x594.c
+@@ -29,7 +29,7 @@ struct gen_74x594_chip {
+ 
+ static void gen_74x594_set_value(struct gpio_chip *, unsigned, int);
+ 
+-static struct gen_74x594_chip *gpio_to_chip(struct gpio_chip *gc)
++static struct gen_74x594_chip *gpio_to_74x594_chip(struct gpio_chip *gc)
+ {
+ 	return container_of(gc, struct gen_74x594_chip, gpio_chip);
+ }
+@@ -49,7 +49,7 @@ static int gen_74x594_direction_output(s
+ 
+ static int gen_74x594_get_value(struct gpio_chip *gc, unsigned offset)
+ {
+-	struct gen_74x594_chip *chip = gpio_to_chip(gc);
++	struct gen_74x594_chip *chip = gpio_to_74x594_chip(gc);
+ 	int ret;
+ 
+ 	mutex_lock(&chip->lock);
+@@ -69,7 +69,7 @@ static void gen_74x594_set_value(struct
+ 	int refresh;
+ 	int i;
+ 
+-	chip = gpio_to_chip(gc);
++	chip = gpio_to_74x594_chip(gc);
+ 	pdata = chip->parent->platform_data;
+ 
+ 	mutex_lock(&chip->lock);
