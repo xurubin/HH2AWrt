@@ -1,0 +1,1431 @@
+--- a/drivers/mtd/Kconfig
++++ b/drivers/mtd/Kconfig
+@@ -29,8 +29,14 @@ config MTD_ROOTFS_ROOT_DEV
+ 
+ config MTD_ROOTFS_SPLIT
+ 	bool "Automatically split 'rootfs' partition for squashfs"
+-	default y
++	default n
+ 
++config MTD_HOMEHUB_PARTS
++	tristate "BTHomeHub V2A dynamic partition table parsing"
++	default y
++	---help---
++	BT Home Hub 2.0A dynamic partition parsing
++	
+ config MTD_REDBOOT_PARTS
+ 	tristate "RedBoot partition table parsing"
+ 	---help---
+--- a/drivers/mtd/Makefile
++++ b/drivers/mtd/Makefile
+@@ -7,6 +7,7 @@ obj-$(CONFIG_MTD)		+= mtd.o
+ mtd-y				:= mtdcore.o mtdsuper.o mtdconcat.o mtdpart.o
+ 
+ obj-$(CONFIG_MTD_OF_PARTS)	+= ofpart.o
++obj-$(CONFIG_MTD_HOMEHUB_PARTS)	+= bthub.o
+ obj-$(CONFIG_MTD_REDBOOT_PARTS) += redboot.o
+ obj-$(CONFIG_MTD_CMDLINE_PARTS) += cmdlinepart.o
+ obj-$(CONFIG_MTD_AFS_PARTS)	+= afs.o
+--- /dev/null
++++ b/drivers/mtd/bthub.c
+@@ -0,0 +1,1400 @@
++/*
++ *  Support for BTHub flash layout.
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/export.h>
++#include <linux/slab.h>
++#include <linux/init.h>
++#include <linux/list.h>
++#include <linux/vmalloc.h>
++#include <linux/proc_fs.h>
++#include <linux/kdev_t.h>
++#include <linux/root_dev.h>
++
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/partitions.h>
++
++#define PT_DEBUG_ON 1
++
++/* Debugging */
++#ifdef PT_DEBUG_ON
++#define PT_DEBUG(str, args...) printk(KERN_INFO str, ##args)
++#if PT_DEBUG_ON > 1
++#define PT_DEBUG2(str, args...) printk(KERN_INFO str, ##args)
++#else
++#define PT_DEBUG2(str, args...)
++#endif
++#else
++#define PT_DEBUG(str, args...)
++#define PT_DEBUG2(str, args...)
++#endif /* PT_DEBUG_ON */
++
++/* Well... get rid of it. */
++#define PT_MEM_BASE 0x80000000
++#define PT_MEM_SIZE 64*1024*1024
++
++/* Flash parameters. */
++#if defined(CONFIG_MTD_HOMEHUB_PARTS)
++#define PT_FLASH_START 0xBE000000
++#define PT_FLASH_SIZE  0x1000000
++#else
++#error "Unknown board configuration!"
++#endif
++
++/*
++ *  Kernel command line option to let us know whether we are currently
++ *  in "system" or "rescue" mode and in flash/RAM.
++ *  It's equal to a start address of the running kernel on the flash/RAM and,
++ *  this way, the parsing code may determine whether this kernel belongs
++ *  to the "system" or "rescue" partition, hence, which one is active.
++ */
++static unsigned int active_partition_address;
++
++static int __init pt_address(char *str)
++{
++        get_option(&str, &active_partition_address);
++	printk(KERN_INFO "livebox: the active partition is reported to be at %X\n", active_partition_address);
++        return 1;
++}
++__setup("bootaddr=", pt_address);
++
++/* All in-flash addresses have a basis of 0xbe000000
++ * (or generally speaking - a start address of the flash in the virtual memory address space) */
++static inline int valid_flash_address(unsigned long addr)
++{
++	if (addr >= PT_FLASH_START
++	    && addr <= PT_FLASH_START + PT_FLASH_SIZE)
++		return 1;
++	return 0;
++}
++
++/* All in-memory addresses have a basis of 0 */
++static inline int valid_memory_address(unsigned long addr)
++{
++	if (addr >= 0
++		&& addr <= PT_MEM_SIZE - (active_partition_address - PT_MEM_BASE))
++		/* ooo... more flexibility? */
++		return 1;
++	return 0;
++}
++
++static inline int valid_flash_range(unsigned long start, unsigned long size)
++{
++	return valid_flash_address(start) && valid_flash_address(start + size);
++}
++
++static inline int valid_memory_range(unsigned long start, unsigned long size)
++{
++	return valid_memory_address(start) && valid_memory_address(start + size);
++}
++
++/* Do we have to look for rootfs in flash or memory? */
++static inline int pt_active_in_flash(void)
++{
++	/* No in-memory mode so far. */
++	return 1;
++//	return valid_flash_address(active_partition_address);
++}
++
++/* Partition representation. */
++
++/* Supported partition types. */
++#define PT_ROOT         1
++#define PT_USER         2
++#define PT_RESCUE       3
++#define PT_CORE		4
++#define PT_KERNEL       5
++#define PT_ROOTFS       6
++#define PT_INFO         7
++#define PT_DS		8
++#define PT_SDRAM	9
++#define PT_MODFS	10
++#define PT_EXTFS	11
++#define PT_EXT		12
++#define PT_COREFS	13
++
++/* Symbolic names. Can be used in lookup operations.
++ * e.g. a request for "system/rootfs" results in
++ * an information block describing a rootfs partition
++ * on the system partition.
++ */
++#define PT_NAME_ROOT    "flash"
++#define PT_NAME_SDRAM	"sdram"
++#define PT_NAME_USER    "rootfs_data" // "user"
++#define PT_NAME_RESCUE  "rescue"
++#define PT_NAME_CORE	"core"
++#define PT_NAME_KERNEL  "kernel"
++#define PT_NAME_ROOTFS  "rootfs"
++#define PT_NAME_INFO    "info"
++#define PT_NAME_DS	"ds"
++#define PT_NAME_MODFS	"modfs"
++#define PT_NAME_EXTFS	"extfs"
++#define PT_NAME_EXT	"extended"
++#define PT_NAME_COREFS	"corefs"
++
++/* Type-specific values. */
++#define PT_SPECIFIC_NONE        0
++#define PT_SPECIFIC_SQUASHFS2   1
++#define PT_SPECIFIC_JFFS2       2
++#define PT_SPECIFIC_LINU        3
++#define PT_SPECIFIC_MUTE        4
++#define PT_SPECIFIC_LIVE        5
++#define PT_SPECIFIC_LAST        6
++
++#define PT_MODE_WRITEABLE	0x1
++#define PT_MODE_INSDRAM		0x2
++
++#define PT_MEMORY_DEV		0x1
++#define PT_FLASH_DEV		0x2
++
++struct pt_partition {
++
++	int type;                       /* answer on what's this? */
++	int specific;                   /* type-specific : e.g. fs type for PT_USER and PT_ROOTFS */
++
++	int mode;                       /* mode flags */
++
++	u32 start, size;                /* denotes a region of the flash */
++
++	u32 vstart, vsize;              /* (vstart, vsize) = (start, size) + some free space, e.g.
++					 * [{... size ... } ... vsize-size ... ] when size != vsize
++					 * or
++					 * [vstart ... {start ... }] when start != vstart
++					 * a partition can be extended at the cost of this free space. */
++	int mtd;                        /* Index (i.e. N) of a corresponding /dev/mtdN device, if exists;
++					 * (-1) otherwise. An mtd device always covers (vstart, vsize). */
++
++	struct pt_partition *parent;    /* Parent's object */
++
++	struct proc_dir_entry
++			*proc_dir;      /* /proc directory */
++
++	struct list_head children;      /* list of chidlren */
++	struct list_head sibling;       /* linkage in parent's children list */
++	struct list_head mtd_list;      /* linkage in the mtd list */
++
++#define PT_DESC_MAX     16
++	char name[PT_DESC_MAX];         /* partition name */
++
++#define PT_DATA_MAX	16
++	char data[PT_DATA_MAX];
++
++#define PT_MD5_MAX	32
++	unsigned char md5[PT_MD5_MAX];
++};
++
++/* Root node. */
++static struct pt_partition pt_root = {
++	.type 		= PT_ROOT,
++	.specific 	= PT_SPECIFIC_NONE,
++	.mode		= PT_MODE_WRITEABLE,	/* writeable -- pay attention :-)*/
++	.mtd		= -1,
++	.children	= LIST_HEAD_INIT(pt_root.children),
++	.sibling	= LIST_HEAD_INIT(pt_root.sibling),
++	.mtd_list	= LIST_HEAD_INIT(pt_root.mtd_list),
++	.name 		= PT_NAME_ROOT,
++};
++
++/* Root node for the in-RAM image. */
++static struct pt_partition pt_memory = {
++	.type 		= PT_SDRAM,
++	.specific 	= PT_SPECIFIC_NONE,
++	.mtd		= -1,
++	.children	= LIST_HEAD_INIT(pt_memory.children),
++	.sibling	= LIST_HEAD_INIT(pt_memory.sibling),
++	.mtd_list	= LIST_HEAD_INIT(pt_memory.mtd_list),
++	.name 		= PT_NAME_SDRAM,
++};
++
++/* List of partitions for which /dev/mtd devices have to be created. */
++static LIST_HEAD(pt_mtd_list);
++static int pt_mtdflash_count, pt_mtdmem_count;
++
++/* Shorthands for the frequently used partitions. */
++struct pt_partition *pt_user, *pt_kernel, *pt_modfs, *pt_rootfs, *pt_extfs;
++
++static int pt_extfs_detected;
++
++int kerSysGetBootMode(void)
++{
++	/*
++	 * -1 : unknown (called too earlier);
++	 *  0 : normal mode;
++	 *  1 : upgrade mode.
++	 */
++	return pt_extfs_detected - 1;
++}
++EXPORT_SYMBOL(kerSysGetBootMode);
++
++/*
++ * Partition handling.
++ *
++ * There is no need (at least, so far) for locking as everything is
++ * constructed before potential readers run and remains
++ * constant afterwards.
++ */
++
++static inline struct pt_partition * __pt_alloc(void)
++{
++        struct pt_partition *pt = kmalloc(sizeof(*pt), GFP_KERNEL);
++
++	if (!pt) {
++                panic("livebox: failed to allocate memory for a partition object.\n");
++                return NULL;
++        }
++	memset(pt, 0, sizeof(*pt));
++
++	INIT_LIST_HEAD(&pt->children);
++	INIT_LIST_HEAD(&pt->sibling);
++	INIT_LIST_HEAD(&pt->mtd_list);
++	pt->mtd = -1;
++	pt->mode = 0;	/* non-writeable */
++
++	return pt;
++}
++
++static struct pt_partition * pt_alloc(int type, int specific, u32 start, u32 size, int mode, const char *name)
++{
++        struct pt_partition *pt = __pt_alloc();
++
++        pt->type = type;
++        pt->specific = specific;
++        pt->start = pt->vstart = start;
++        pt->size = pt->vsize = size;
++	pt->mode |= mode;
++        strncpy(pt->name, name, sizeof(pt->name) - 1);
++
++        return pt;
++}
++
++static void pt_free(struct pt_partition *pt)
++{
++	/* Fix me: not implemented properly. */
++
++        /* first unlink and delete all the children nodes? */
++        list_del(&pt->sibling);
++        kfree(pt);
++}
++
++static int pt_add(struct pt_partition *new_pt, struct pt_partition *parent)
++{
++        /* So far, add just to the end. */
++        list_add_tail(&new_pt->sibling, &parent->children);
++	new_pt->parent = parent;
++        return 0;
++}
++
++static struct pt_partition *pt_lookup(struct pt_partition *pt, const char *name)
++{
++	struct list_head *head;
++
++	list_for_each(head, &pt->children) {
++		struct pt_partition *child = list_entry(head, struct pt_partition, sibling);
++
++		if (!strcmp(name, child->name))
++			return child;
++	}
++	return NULL;
++}
++
++static void pt_mtdlist_add(struct pt_partition *pt)
++{
++	if (!pt)
++		return;
++
++	list_add_tail(&pt->mtd_list, &pt_mtd_list);
++	if (pt->mode & PT_MODE_INSDRAM)
++		pt_mtdmem_count++;
++	else
++		pt_mtdflash_count++;
++}
++
++static int pt_setup_data(struct pt_partition *pt, const char *data, size_t length)
++{
++	if (length + 1 > PT_DATA_MAX)
++		return -1;
++
++	memcpy(pt->data, data, length);
++	return 0;
++}
++
++/*
++ * Search patterns.
++ */
++
++static u32 ERASE_BLOCK_SIZE = (1 << 16); /* 64 Kb */
++
++struct iterator {
++	u32 pos, end;
++        int step;
++};
++
++typedef size_t (*read_device_fn)(loff_t from, unsigned char *buf, size_t len);
++
++struct pt_actor {
++	struct list_head se_list;
++
++	/* Search pattern. */
++	int (*apply_pattern)(struct pt_actor *self, struct iterator *itr);
++
++	/* Read data from a corresponding device. */
++	size_t (*read_device)(loff_t from, unsigned char *buf, size_t len);
++
++	struct pt_partition *parent;
++	int  device_id;
++	void *cookie;
++};
++
++#define BUILD_WORD(a,b,c,d)  ((a << 24) | (b << 16) | (c << 8) | (d))
++
++/*
++ * User partition pattern (JFFS2).
++ */
++
++struct user_pattern_data {
++	struct pt_partition *pt;
++	int done, expected;
++};
++
++static int user_pattern(struct pt_actor *self, struct iterator *itr)
++{
++	struct user_pattern_data *data 	= (struct user_pattern_data *)self->cookie;
++	struct pt_partition *pt = (struct pt_partition *)data->pt;
++	unsigned char buf[16];
++	int ret = 0;
++
++	/* We are interested only if it's a beginning of an erase block. */
++	if (itr->pos & (ERASE_BLOCK_SIZE - 1))
++		return 0;
++
++	/* So far we expect the user partition containing a single JFFS2 partition.
++	 * If it's not true, just remove the following "if"-statement. In fact,
++	 * this pattern searches for JFFS2 partitions and can be used as such.
++	 */
++	if (data->done)
++		return 0;
++
++	if ((ret = self->read_device(itr->pos, buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "bthub: (user_pattern)"
++				"read_device(offset: %d, size: %d) failed, ret: %d\n",
++				itr->pos, sizeof(buf), ret);
++		return -1;
++	}
++
++	if (buf[0] == 0x19 && buf[1] == 0x85) {
++		if (unlikely(!pt))
++			data->pt = pt = pt_alloc(PT_USER, PT_SPECIFIC_JFFS2,
++						itr->pos,
++						ERASE_BLOCK_SIZE,
++						PT_MODE_WRITEABLE, /* writeable */
++						PT_NAME_USER);
++		else {
++			pt->size += ERASE_BLOCK_SIZE;
++			pt->vsize += ERASE_BLOCK_SIZE;
++		}
++
++		data->expected = 1;
++		ret = 1;
++
++		PT_DEBUG2("bthub: jffs2 block is detected\n");
++
++	} else if (data->expected) {
++		if (pt->size / ERASE_BLOCK_SIZE >= 5) {
++			data->done = 1;
++
++			/* Report success. */
++			pt_add(pt, self->parent);
++			PT_DEBUG("bthub: user partition is created\n");
++		} else {
++			data->done = 0;
++			pt_free(pt);
++			printk(KERN_ERR "bthub: misformatted jffs2 partition (less than 5 sectors)\n");
++		}
++
++		data->expected = 0;
++		data->pt = NULL;
++	}
++
++	return ret;
++}
++
++/*
++ * If it's not a valid address within flash or memory, just bail it out.
++ */
++
++#define RETURN_IF_INVALID_ADDR(dev, addr, msg, args...)	\
++	if ( !((dev == PT_FLASH_DEV && valid_flash_address(addr))		\
++		|| (dev == PT_MEMORY_DEV && valid_memory_address(addr))) ) {	\
++			printk(KERN_EMERG msg, ##args);				\
++			return -1;						\
++	}
++
++#define RETURN_IF_INVALID_RANGE(dev, start, size, msg, args...)	\
++	if ( !((dev == PT_FLASH_DEV && valid_flash_range(start, size))		\
++		|| (dev == PT_MEMORY_DEV && valid_memory_range(start, size))) ){\
++			printk(KERN_EMERG msg, ##args);				\
++			return -1;						\
++	}
++
++#include "../../fs/squashfs/squashfs_fs.h"
++#define SQUASHFS_MAGIC_LZMA            0x71736873
++#define SQUASHFS_MAGIC		           0x73717368
++struct fs_layout {
++	u32 fs_start;
++	u32 fs_size;
++};
++
++static int fs_pattern(u32 start_address, struct fs_layout *fsl, struct pt_actor *self)
++{
++	unsigned char buf[sizeof(struct squashfs_super_block)];
++	struct squashfs_super_block *sb;
++	u32 aligned_size;
++	int ret;
++
++	if ((ret = self->read_device(start_address, buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s: read_device(offset: %d, size: %d) failed, ret: %d\n",
++				__FUNCTION__, start_address, sizeof(buf), ret);
++		return 0;
++	}
++
++	sb = (struct squashfs_super_block *)buf;
++
++	PT_DEBUG("bthub: SquashFS is expected at %x, found magic is %x\n",
++		start_address, sb->s_magic);
++
++	if (sb->s_magic != SQUASHFS_MAGIC && sb->s_magic != SQUASHFS_MAGIC_LZMA)
++		return 0;
++
++	/* SquashFS partition. */
++	fsl->fs_start = start_address;
++	fsl->fs_size  = ALIGN(sb->bytes_used, ERASE_BLOCK_SIZE);
++
++	aligned_size = ALIGN(start_address + sb->bytes_used, ERASE_BLOCK_SIZE);
++	fsl->fs_size = aligned_size - start_address;
++
++	PT_DEBUG("bthub: SquashFS (start: %x, size %x)\n", fsl->fs_start, fsl->fs_size);
++	return fsl->fs_size;
++}
++
++/*
++ * System and rescue partition pattern: "kernel" + "rootfs (squashfs2)".
++ */
++
++static int corefs_pattern(struct pt_actor *self, struct iterator *itr)
++{
++	const int header_size = 26;
++	const char magic_linu[] = "LINU";
++	const char magic_mute[] = "MUTE";
++	const char magic_live[] = "LIVE";
++
++	unsigned char buf[32];
++	u32 *u32buf = (u32 *)buf;
++	char softco_version[8];
++
++	u32 pt_start, kernel_start, info_start, ds_start,
++	    pt_size, kernel_size, info_size, ds_size, start_itr;
++	int device_id = self->device_id;
++
++	struct pt_partition *pt = NULL, *child_pt;
++	int ret = 0, found = 0;
++	struct fs_layout mfs_info, rfs_info;
++
++	ds_start = 0;
++	ds_size = 0;
++
++	if ((ret = self->read_device(itr->pos, buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s:"
++			"read_device(offset: %d, size: %d) failed, ret: %d\n",
++			__FUNCTION__, itr->pos, sizeof(buf), ret);
++		return -1;
++	}
++
++	/* Look for a header. */
++	if (u32buf[0] == 0 &&
++	    (buf[17] == magic_linu[0] || buf[17] == magic_mute[0]
++	     || buf[17] == magic_live[0])) {
++		if (!memcmp(&buf[17], magic_linu, 4))
++			found = PT_SPECIFIC_LINU;
++		else if (!memcmp(&buf[17], magic_mute, 4))
++			found = PT_SPECIFIC_MUTE;
++		else if (!memcmp(&buf[17], magic_live, 4))
++			found = PT_SPECIFIC_LIVE;
++	}
++
++	if (!found)
++		return 0;
++
++	PT_DEBUG("bthub: header of CORE partition is detected\n");
++
++	memset(softco_version, 0, sizeof(softco_version));
++	memcpy(softco_version, &buf[5], 7);
++
++	pt_start = itr->pos;
++
++	/* Kernel */
++	kernel_start = itr->pos + header_size;
++	kernel_size = BUILD_WORD(buf[22],buf[23],buf[24],buf[25]);
++	RETURN_IF_INVALID_RANGE(device_id, kernel_start, kernel_size,
++		"ERROR : kernel is out of flash. Broken bli image?\n");
++
++	PT_DEBUG("bthub: kernel is at offset (%x), size (%x)\n",
++		kernel_start, kernel_size);
++
++	/* Info section. */
++	info_start = BUILD_WORD(buf[12],buf[13],buf[14],buf[15]) + pt_start;
++	RETURN_IF_INVALID_ADDR(device_id, info_start,
++		"bthub: ERROR - info_start (%x) is out of flash\n", info_start);
++
++	info_start += sizeof(u32);
++
++	if ((ret = self->read_device(info_start - sizeof(u32), buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s: "
++			"read_device(offset: %X, size: %X) failed, ret: %d\n",
++			__FUNCTION__, info_start - sizeof(u32), sizeof(buf), ret);
++		return -1;
++	}
++	info_size = BUILD_WORD(buf[0], buf[1], buf[2], buf[3]);
++	RETURN_IF_INVALID_RANGE(device_id, info_start, info_size,
++		"ERROR : info block is out of the flash\n");
++
++	PT_DEBUG("%s: info is at offset (%x), size (%x) including a header of (%x)\n",
++		__FUNCTION__, info_start, info_size, sizeof(u32));
++
++	/* DS section (md5 signature). */
++	ds_start = info_start + (info_size - sizeof(u32)) + sizeof(u32);
++
++	if ((ret = self->read_device(ds_start - sizeof(u32), buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s: read_device(offset: %X, size: %X) failed, ret: %d\n",
++			__FUNCTION__, ds_start - sizeof(u32), sizeof(buf), ret);
++		return -1;
++	}
++	ds_size = BUILD_WORD(buf[0], buf[1], buf[2], buf[3]);
++	PT_DEBUG("%s: ds is at offset (%x), size (%x) including a header of (%x)\n",
++		__FUNCTION__, ds_start, ds_size, sizeof(u32));
++	RETURN_IF_INVALID_RANGE(device_id, ds_start, ds_size,
++		"ERROR : ds block is out of the flash\n");
++
++	/* Size of the whole "core" partition. */
++	pt_size = ALIGN(ds_start + (ds_size - sizeof(u32)) - pt_start, ERASE_BLOCK_SIZE);
++
++
++	if ((ds_size - sizeof(u32)) == PT_MD5_MAX) {
++		if ((ret = self->read_device(ds_start, pt->md5, PT_MD5_MAX)) != sizeof(buf)) {
++			printk(KERN_ERR "%s: read_device(offset: %X, size: %X) failed, ret: %d\n",
++				__FUNCTION__, ds_start, PT_MD5_MAX, ret);
++			return -1;
++		}
++		PT_DEBUG("bthub: a signature has been stored\n");
++	}
++
++	/* Look for modfs. */
++	start_itr = ALIGN(kernel_start + kernel_size, 0x1000);
++
++	ret = fs_pattern(start_itr, &mfs_info, self);
++	if (!ret) {
++		printk(KERN_ERR "%s: failed to detect [modfs]\n", __FUNCTION__);
++		return start_itr - itr->pos;
++	}
++	start_itr = ALIGN(start_itr + ret, ERASE_BLOCK_SIZE);
++
++	/* Look for rootfs. */
++	ret = fs_pattern(start_itr, &rfs_info, self);
++	if (!ret) {
++		printk(KERN_ERR "%s: failed to detect [rootfs]\n", __FUNCTION__);
++		return start_itr - itr->pos;
++	}
++	start_itr = ALIGN(start_itr + ret, ERASE_BLOCK_SIZE);
++
++	/*
++	 * Build the following hieararchy:
++	 *
++	 * |--CORE-+
++	 *	   |-- COREFS-+
++	 *	   |	      |-- kernel
++	 *	   |	      |-- modfs
++	 *	   |-- rootfs
++	 */
++
++	pt = pt_alloc(PT_COREFS, 0, pt_start, rfs_info.fs_start - pt_start,
++			0, PT_NAME_COREFS);
++
++	child_pt = pt_alloc(PT_KERNEL, found,
++			kernel_start, kernel_size, 0, PT_NAME_KERNEL);
++	pt_add(child_pt, pt);
++
++	child_pt = pt_alloc(PT_MODFS, PT_SPECIFIC_SQUASHFS2,
++			mfs_info.fs_start, mfs_info.fs_size, 0, PT_NAME_MODFS);
++	pt_add(child_pt, pt);
++
++	child_pt = pt;
++
++	pt = pt_alloc(PT_CORE, 0, pt_start, pt_size, 0, PT_NAME_CORE);
++	pt_setup_data(pt, softco_version, sizeof(softco_version));
++	pt_add(child_pt, pt);
++
++	child_pt = pt_alloc(PT_ROOTFS, PT_SPECIFIC_SQUASHFS2,
++			rfs_info.fs_start, rfs_info.fs_size, 0, PT_NAME_ROOTFS);
++	pt_add(child_pt, pt);
++
++	/* Attach the "core" partition. */
++	pt_add(pt, self->parent);
++
++	/* Return an amount of flash we have processed. */
++	return start_itr - itr->pos;
++}
++
++static int extended_pattern(struct pt_actor *self, struct iterator *itr)
++{
++	const char magic_exte[] = "EXTE";
++
++	unsigned char buf[32];
++	u32 *u32buf = (u32 *)buf;
++	char softco_version[8];
++
++	u32 pt_start, info_start, ds_start,
++	    pt_size, info_size, ds_size, start_itr;
++	int device_id = self->device_id;
++
++	struct pt_partition *pt, *child_pt;
++	int ret = 0, found = 0;
++	struct fs_layout fsl;
++
++	ds_start = 0;
++	ds_size = 0;
++
++	if ((ret = self->read_device(itr->pos, buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s: "
++				"read_device(offset: %d, size: %d) failed, ret: %d\n",
++				__FUNCTION__, itr->pos, sizeof(buf), ret);
++		return -1;
++	}
++
++	/* Look for a header. */
++	if (u32buf[0] == 0 && (buf[16] == magic_exte[0])) {
++		if (!memcmp(&buf[16], magic_exte, 4))
++			found = PT_SPECIFIC_LINU;
++	}
++
++	if (!found)
++		return 0;
++
++	PT_DEBUG("bthub: header of EXTENDED partitin is detected\n");
++
++	memset(softco_version, 0, sizeof(softco_version));
++	memcpy(softco_version, &buf[5], 7);
++
++	pt_start = itr->pos;
++
++	/* Info section. */
++	info_start = BUILD_WORD(buf[12],buf[13],buf[14],buf[15]) + pt_start;
++	RETURN_IF_INVALID_ADDR(device_id, info_start,
++		"bthub: ERROR - info_start (%x) is out of flash\n", info_start);
++
++	info_start += sizeof(u32);
++
++	if ((ret = self->read_device(info_start - sizeof(u32), buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s: read_device(offset: %X, size: %X) failed, ret: %d\n",
++			__FUNCTION__, info_start - sizeof(u32), sizeof(buf), ret);
++		return -1;
++	}
++	info_size = BUILD_WORD(buf[0], buf[1], buf[2], buf[3]);
++	PT_DEBUG("%s: info is at offset (%x), size (%x) including a header of (%x)\n",
++		__FUNCTION__, info_start, info_size, sizeof(u32));
++	RETURN_IF_INVALID_RANGE(device_id, info_start, info_size,
++		"ERROR : info block is out of the flash\n");
++
++	/* DS section (md5 signature). */
++	ds_start = info_start + (info_size - sizeof(u32)) + sizeof(u32);
++
++	if ((ret = self->read_device(ds_start - sizeof(u32), buf, sizeof(buf))) != sizeof(buf)) {
++		printk(KERN_ERR "%s: read_device(offset: %X, size: %X) failed, ret: %d\n",
++			__FUNCTION__, ds_start - sizeof(u32), sizeof(buf), ret);
++		return -1;
++	}
++	ds_size = BUILD_WORD(buf[0], buf[1], buf[2], buf[3]);
++	PT_DEBUG("%s: ds is at offset (%x), size (%x) including a header of (%x)\n",
++		__FUNCTION__, ds_start, ds_size, sizeof(u32));
++	RETURN_IF_INVALID_RANGE(device_id, ds_start, ds_size,
++		"ERROR : ds block is out of the flash\n");
++
++	/* Main partition. */
++	pt_size = ALIGN(ds_start + (ds_size - sizeof(u32)) - pt_start, ERASE_BLOCK_SIZE);
++
++	pt = pt_alloc(PT_EXT, 0, pt_start, pt_size, PT_MODE_WRITEABLE, PT_NAME_EXT);
++	pt_setup_data(pt, softco_version, sizeof(softco_version));
++
++	if ((ds_size - sizeof(u32)) == PT_MD5_MAX) {
++		if ((ret = self->read_device(ds_start, pt->md5, PT_MD5_MAX)) != sizeof(buf)) {
++			printk(KERN_ERR "%s: read_device(offset: %X, size: %X) failed, ret: %d\n",
++				__FUNCTION__, ds_start, PT_MD5_MAX, ret);
++			return -1;
++		}
++		PT_DEBUG("bthub: a signature has been stored\n");
++	}
++
++	/* Look for extfs. */
++	start_itr = ALIGN(itr->pos + 0x1000, 0x1000);
++	ret = fs_pattern(start_itr, &fsl, self);
++	if (!ret) {
++		printk(KERN_ERR "%s: failed to detect [rootfs]\n", __FUNCTION__);
++		return start_itr - itr->pos;
++	}
++
++	child_pt = pt_alloc(PT_EXTFS, PT_SPECIFIC_SQUASHFS2,
++			fsl.fs_start, fsl.fs_size, 0, PT_NAME_EXTFS);
++	pt_add(child_pt, pt);
++
++	/* Finally, add the "extended" partition. */
++	pt_add(pt, self->parent);
++
++	start_itr = ALIGN(start_itr + ret, 0x1000);
++	/* Return an amount of flash we have processed. */
++	return start_itr - itr->pos;
++}
++
++#define PT_BUILD_VERSION	0
++
++static void pt_generic_search(struct iterator *itr, struct list_head *actors)
++{
++	PT_DEBUG2("pt_generic_search: started, version: %d\n", PT_BUILD_VERSION);
++
++	while (itr->pos + itr->step <= itr->end) {
++		struct list_head *head;
++		PT_DEBUG2("pt_generic_search: pos (%X)\n", itr->pos);
++
++		/* Run all registered actors. */
++		list_for_each(head, actors) {
++			struct pt_actor *actor = list_entry(head, struct pt_actor, se_list);
++			actor->apply_pattern(actor, itr);
++		}
++
++		itr->pos += itr->step;
++	}
++}
++
++static void pt_flash_finalize(void)
++{
++	struct pt_partition *pt_core, *pt_ext, *pt_corefs,
++			    *__pt_rootfs = NULL, *__pt_modfs = NULL;
++
++	/* Not flexible. */
++	u32 user_start = PT_FLASH_START + 0x40000,
++	    user_size  = 0x100000 - 0x40000;
++
++	pt_core = pt_lookup(&pt_root, PT_NAME_CORE);
++	pt_corefs = pt_lookup(pt_core, PT_NAME_COREFS);
++	pt_ext  = pt_lookup(&pt_root, PT_NAME_EXT);
++	pt_user = pt_lookup(&pt_root, PT_NAME_USER);
++
++	if (pt_core) {
++		user_size = pt_core->start - user_start;
++
++		/* An in-memory version might already have been detected. */
++		__pt_rootfs = pt_lookup(pt_core, PT_NAME_ROOTFS);
++		if (pt_corefs)
++			__pt_modfs  = pt_lookup(pt_corefs, PT_NAME_MODFS);
++	}
++
++	if (!pt_user) {
++		printk(KERN_INFO "bthub: no valid user partition detected. An empty one will be created.\n");
++
++		pt_user = pt_alloc(PT_USER, 0, user_start, user_size, PT_MODE_WRITEABLE, PT_NAME_USER);
++		pt_add(pt_user, &pt_root);
++	} else {
++                /*
++		 * TEMP: this is to address a case when the user partition has been partially corrupted but there at least
++		 * 5 contiguous blocks survived so a smaller partition is detected. But we want it to be as large as before
++		 * (sure we can't know how big it was) so let's try enlarge it at the cost of free space.
++		 */
++		int enlarged = 0;
++
++		if (pt_user->vstart > user_start)
++			enlarged = pt_user->vstart = pt_user->start = user_start;
++		if (pt_user->vsize < user_size)
++			enlarged = pt_user->vsize = pt_user->size = user_size;
++
++		if (enlarged)
++			printk(KERN_INFO "bthub: user partition has been enlarged -> [%x : %x]\n",
++				pt_user->vstart, pt_user->vsize);
++	}
++	pt_mtdlist_add(pt_user);
++
++	/* We may have an in-memory CORE partition in place. */
++	if (!pt_rootfs) {
++		if (!__pt_rootfs)
++			panic("bthub: no valid rootfs has been detected. Oops...\n");
++
++		pt_rootfs = __pt_rootfs;
++		pt_mtdlist_add(pt_rootfs);
++	}
++
++	/* Expose the corefs for easy kernel upgrade. */
++	if (pt_corefs) {
++		pt_mtdlist_add(pt_corefs);
++	} else {
++		printk(KERN_WARNING "bthub: no valid corefs has been detected.\n");
++	}
++
++	if (!pt_modfs) {
++		if (!__pt_modfs)
++			printk(KERN_WARNING "bthub: no valid modfs has been detected. Continued.\n");
++		else {
++			pt_modfs = __pt_modfs;
++			pt_mtdlist_add(pt_modfs);
++		}
++	}
++
++	/* In-memory extfs? */
++
++
++	if (!pt_ext) {
++		u32 start = pt_core->vstart + pt_core->vsize,
++		    size  = (pt_root.vstart + pt_root.vsize) - start;
++
++		pt_extfs_detected = 2;
++
++		/* it's ok if there is no valid extfs in place. */
++		printk(KERN_INFO "bthub: no valid extended partition detected. An empty one will be created.\n");
++
++		/* The first partiton will contain the file system itself (and so can be mounted) while
++		 * the second one -- the whole extended partition (including headers). */
++		pt_extfs = pt_alloc(PT_EXTFS, PT_SPECIFIC_SQUASHFS2,
++			start + 0x1000, (size - 0x1000) - 2*ERASE_BLOCK_SIZE, 0, PT_NAME_EXTFS);
++		pt_ext = pt_alloc(PT_EXT, 0, start, size, PT_MODE_WRITEABLE, PT_NAME_EXT);
++
++		pt_add(pt_extfs, pt_ext);
++		pt_add(pt_ext, &pt_root);
++
++	} else {
++		pt_extfs_detected = 1;
++
++		/* Add free space to the "extended". */
++		pt_ext->vsize = (pt_root.vstart + pt_root.vsize) - pt_ext->vstart;
++
++		pt_extfs = pt_lookup(pt_ext, PT_NAME_EXTFS);
++	}
++	pt_mtdlist_add(pt_extfs);
++	pt_mtdlist_add(pt_ext);
++
++	/* An MTD partition covering the whole flash. */
++	pt_mtdlist_add(&pt_root);
++}
++
++static int pt_flash_parse(u32 start, u32 size, int step, read_device_fn read_device)
++{
++	struct pt_actor	core, ext, user;
++	struct user_pattern_data upd;
++	struct iterator	itr;
++	LIST_HEAD(actors);
++
++	PT_DEBUG2("pt_build: start (%x), size (%x), step (%x)\n",
++		start, size, step);
++
++	memset(&upd, 0, sizeof(upd));
++
++	itr.pos = start;
++	itr.end = start + size;
++	itr.step = step;
++
++	core.apply_pattern = &corefs_pattern;
++	core.read_device = read_device;
++	core.parent = &pt_root;
++	core.device_id = PT_FLASH_DEV;
++	core.cookie = NULL;
++	INIT_LIST_HEAD(&core.se_list);
++
++	user.apply_pattern = &user_pattern;
++	user.read_device = read_device;
++	user.parent = &pt_root;
++	user.device_id = PT_FLASH_DEV;
++	user.cookie = &upd;
++	INIT_LIST_HEAD(&user.se_list);
++
++	ext.apply_pattern = &extended_pattern;
++	ext.read_device = read_device;
++	ext.parent = &pt_root;
++	ext.device_id = PT_FLASH_DEV;
++	ext.cookie = NULL;
++	INIT_LIST_HEAD(&ext.se_list);
++
++	list_add_tail(&core.se_list, &actors);
++	list_add_tail(&user.se_list, &actors);
++	list_add_tail(&ext.se_list, &actors);
++
++	pt_root.start = pt_root.vstart = PT_FLASH_START;
++	pt_root.size = pt_root.vsize = size;
++
++	pt_generic_search(&itr, &actors);
++	pt_flash_finalize();
++
++	return pt_mtdflash_count;
++}
++
++static int pt_memory_finalize(void)
++{
++	struct pt_partition *pt;
++
++	pt = pt_lookup(&pt_memory, PT_NAME_CORE);
++	if (!pt)
++		panic("bthub: no valid in-RAM partitions have been detected\n");
++
++	if (!(pt_rootfs = pt_lookup(pt, PT_NAME_ROOTFS)))
++		panic("bthub: no in-RAM ROOTFS detected\n");
++
++	pt_rootfs->mode |= PT_MODE_INSDRAM;
++	pt_mtdlist_add(pt_rootfs);
++}
++
++static int pt_memory_parse(u32 start, u32 size, int step, read_device_fn read_device)
++{
++	struct pt_actor	core;
++	struct iterator	itr;
++	LIST_HEAD(actors);
++
++	PT_DEBUG2("pt_build_mem: start (%x), size (%x), step (%x)\n",
++		start, size, step);
++
++	itr.pos = start;
++	itr.end = start + size;
++	itr.step = step;
++
++	core.apply_pattern = &corefs_pattern;
++	core.read_device = read_device;
++	core.parent = &pt_memory;
++	core.device_id = PT_MEMORY_DEV;
++	core.cookie = NULL;
++	INIT_LIST_HEAD(&core.se_list);
++
++	list_add_tail(&core.se_list, &actors);
++
++	pt_memory.size = pt_memory.vsize = PT_MEM_SIZE;
++
++	pt_generic_search(&itr, &actors);
++	pt_memory_finalize();
++
++	return pt_mtdmem_count;
++}
++
++/*
++ *	/proc support.
++ */
++
++#define READ_PROC_EPILOGUE	\
++        len = p - page - off;	\
++        if (len <= off + count)	\
++                *eof = 1;	\
++        *start = page + off;	\
++        if (len > count)	\
++                len = count;	\
++        if (len < 0)		\
++                len = 0;	\
++
++
++static int pt_generic_write_proc(const char __user *buffer, unsigned long count, u32 *result)
++{
++	char *next, buf[16];
++
++	memset(buf, 0, sizeof(buf));
++
++	if (copy_from_user(buf, buffer, count))
++		return -EFAULT;
++
++	*result = simple_strtol(buf, &next, 16);
++
++	return count;
++}
++
++static int start_read_proc(char *page,
++		           char **start,
++			   off_t off, int count, int *eof, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++        char *p = page;
++        int len = 0;
++
++        p += sprintf(p, "%x", pt->start);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++static int start_write_proc(struct file *file, const char __user *buffer,
++			unsigned long count, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++
++	return pt_generic_write_proc(buffer, count, &pt->start);
++}
++
++static int size_read_proc(char *page,
++		           char **start,
++			   off_t off, int count, int *eof, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++        char *p = page;
++        int len = 0;
++
++        p += sprintf(p, "%x", pt->size);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++static int size_write_proc(struct file *file, const char __user *buffer,
++			unsigned long count, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++
++	return pt_generic_write_proc(buffer, count, &pt->size);
++}
++
++
++static int vstart_read_proc(char *page,
++		           char **start,
++			   off_t off, int count, int *eof, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++        char *p = page;
++        int len = 0;
++
++        p += sprintf(p, "%x", pt->vstart);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++static int vstart_write_proc(struct file *file, const char __user *buffer,
++					unsigned long count, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++
++	return pt_generic_write_proc(buffer, count, &pt->vstart);
++}
++
++static int vsize_read_proc(char *page,
++		           char **start,
++			   off_t off, int count, int *eof, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++        char *p = page;
++        int len = 0;
++
++        p += sprintf(p, "%x", pt->vsize);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++static int vsize_write_proc(struct file *file, const char __user *buffer,
++					unsigned long count, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++
++	return pt_generic_write_proc(buffer, count, &pt->vsize);
++}
++
++static int specific_read_proc(char *page,
++		           char **start,
++			   off_t off, int count, int *eof, void *data)
++{
++	/* Keep in correlation with pt_api.h. */
++	static char *description[] = {
++		"not defined",	/* PT_SPECIFIC_NONE */
++		"squashfs2",	/* PT_SPECIFIC_SQUASHFS2 */
++		"jffs2",	/* PT_SPECIFIC_JFFS2 */
++		"linu",		/* PT_SPECIFIC_LINU */
++		"mute",		/* PT_SPECIFIC_MUTE */
++		"wrong object"	/* PT_SPECIFIC_LAST */
++	};
++
++	struct pt_partition *pt = (struct pt_partition *)data;
++        int len = 0, specific = pt->specific;
++        char *p = page;
++
++	if (specific < PT_SPECIFIC_NONE || specific >= PT_SPECIFIC_LAST)
++		specific = PT_SPECIFIC_NONE;
++
++        p += sprintf(p, description[specific]);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++static int softcov_read_proc(char *page,
++			     char **start,
++			     off_t off, int count, int *eof, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++        char *p = page;
++        int len = 0;
++
++        p += sprintf(p,"%d.%d.%d.%d.%d.%d.%d",
++		pt->data[0], pt->data[1], pt->data[2], pt->data[3],
++		pt->data[4], pt->data[5], pt->data[6]);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++static int md5_read_proc(char *page,
++			     char **start,
++			     off_t off, int count, int *eof, void *data)
++{
++	struct pt_partition *pt = (struct pt_partition *)data;
++        char *p = page;
++        int len = 0, i;
++
++	for (i = 0; i < PT_MD5_MAX; i++)
++		p += sprintf(p,"%c", pt->md5[i]);
++
++	READ_PROC_EPILOGUE
++        return len;
++}
++
++#undef READ_PROC_EPILOGUE
++
++static int __init pt_proc_add(struct pt_partition *pt)
++{
++	struct proc_dir_entry *parent = (pt->parent)? pt->parent->proc_dir : NULL;
++	struct proc_dir_entry *child;
++
++	/*
++	 * "mtd_name" can be either /dev/mtdN or /dev/mtdblockN so the size below fits both
++	 * and we keep overhead as low as possible because we can be called recursively.
++	 */
++	char mtd_name[32];
++
++	pt->proc_dir = proc_mkdir(pt->name, parent);
++
++	if (!pt->proc_dir) {
++		printk(KERN_ERR "PT: pt_proc_add() failed\n");
++		return -1;
++	}
++
++	/* the following nodes are being deleted only upon system reboot. */
++	child = create_proc_entry("vstart", 0644, pt->proc_dir);
++	if (child) {
++		child->read_proc = vstart_read_proc;
++		child->write_proc = vstart_write_proc;
++		child->data = pt;
++	}
++	child = create_proc_entry("vsize",  0644, pt->proc_dir);
++	if (child) {
++		child->read_proc = vsize_read_proc;
++		child->write_proc = vsize_write_proc;
++		child->data = pt;
++	}
++
++	child = create_proc_entry("start", 0644, pt->proc_dir);
++	if (child) {
++		child->read_proc = start_read_proc;
++		child->write_proc = start_write_proc;
++		child->data = pt;
++	}
++	child = create_proc_entry("size",  0644, pt->proc_dir);
++	if (child) {
++		child->read_proc = size_read_proc;
++		child->write_proc = size_write_proc;
++		child->data = pt;
++	}
++
++	create_proc_read_entry("specific", 0444, pt->proc_dir, specific_read_proc, pt);
++
++	if (pt->type == PT_CORE || pt->type == PT_EXT) {
++		create_proc_read_entry("softcov", 0444, pt->proc_dir,
++			softcov_read_proc, pt);
++		create_proc_read_entry("md5", 0444, pt->proc_dir,
++			md5_read_proc, pt);
++	}
++
++	if (pt->mtd != -1) {
++		/* mtdchar creates 2 devices, i - for 'rw' mode and (i + 1) - 'ro': */
++		snprintf(mtd_name, sizeof(mtd_name)-1, "/dev/mtd%d", pt->mtd * 2);
++		proc_symlink("mtd", pt->proc_dir, mtd_name);
++
++		snprintf(mtd_name, sizeof(mtd_name)-1, "/dev/mtdblock%d", pt->mtd);
++		proc_symlink("mtdblock", pt->proc_dir, mtd_name);
++	}
++
++	return 0;
++}
++
++static void __init pt_proc_add_recursive(struct pt_partition *pt, int off)
++{
++	static char padding[] = "                "; /* 16 */
++	int offset = 15 - off;
++	struct list_head *head;
++
++	if (pt_proc_add(pt))
++		return;
++
++	printk(KERN_INFO "%s[ %s ]\n", &padding[offset], pt->name);
++
++	/* Now children. */
++	list_for_each(head, &pt->children) {
++		struct pt_partition *child_pt = list_entry(head, struct pt_partition, sibling);
++		pt_proc_add_recursive(child_pt, off + 2);
++	}
++#if 0
++	if (pt == &pt_root) {
++		if (pt_active == PT_SYSTEM) {
++			proc_symlink("active", pt_root.proc_dir, PT_NAME_SYSTEM);
++			proc_symlink("upgrade", pt_root.proc_dir, PT_NAME_RESCUE);
++		} else {
++			proc_symlink("active", pt_root.proc_dir, PT_NAME_RESCUE);
++			proc_symlink("upgrade", pt_root.proc_dir, PT_NAME_SYSTEM);
++		}
++	}
++#endif
++}
++
++static void __init pt_proc_init(void)
++{
++	if (pt_root.proc_dir)
++		return;
++
++	printk(KERN_INFO "PT: creating a tree under /proc...\n");
++	if (!pt_active_in_flash())
++		pt_proc_add_recursive(&pt_memory, 2);
++	pt_proc_add_recursive(&pt_root, 2);
++	printk(KERN_INFO "PT: done.\n");
++}
++
++/*
++ *	MTD parser.
++ */
++
++static struct mtd_info *global_master;
++
++/* Read data from a corresponding device. */
++static size_t read_flash_device(loff_t from, unsigned char *buf, size_t len)
++{
++	int retlen, ret;
++	from -= PT_FLASH_START;
++
++	ret = global_master->read(global_master, from, len, &retlen, buf);
++
++	return ret? 0 : retlen;
++}
++
++static size_t read_memory_device(loff_t from, unsigned char *buf, size_t len)
++{
++	void *addr = (void *)(active_partition_address + (unsigned int)from);
++
++	/* check out-of-boundary */
++
++	memcpy(buf, addr, len);
++	return len;
++}
++
++extern int board_getsdramsize(void);
++extern int register_mtd_device_in_ram(char *name, unsigned long start, unsigned long len);
++
++static int parse_bthub_partitions(struct mtd_info *master,
++				struct mtd_partition **pparts,
++				unsigned long origin)
++{
++	int nr_flash = 0, nr_memory = 0,
++		i = 0;
++	struct mtd_partition *parts;
++	struct list_head *head;
++
++	ERASE_BLOCK_SIZE = master->erasesize;
++
++	printk("parse_bthub_partitions (block_size: %lu)\n", ERASE_BLOCK_SIZE);
++
++	if (!pt_active_in_flash()) {
++		nr_memory = pt_memory_parse(0, PT_MEM_SIZE - (active_partition_address - PT_MEM_BASE),
++				master->erasesize, &read_memory_device);
++	}
++
++	global_master = master;
++	nr_flash = pt_flash_parse(PT_FLASH_START,
++			master->size, master->erasesize, &read_flash_device);
++
++	if (!nr_flash) {
++		printk("parse_bthub_partitions: failed (no partitions found)\n");
++		return -EBADF;
++	}
++
++	parts = kmalloc(sizeof(*parts) * nr_flash, GFP_KERNEL);
++
++	if (!parts) {
++		printk("%s: failed (out of memory)\n", __FUNCTION__);
++		return -ENOMEM;
++	}
++
++	memset(parts, 0, sizeof(*parts) * nr_flash);
++
++	list_for_each(head, &pt_mtd_list) {
++		struct pt_partition *pt = list_entry(head, struct pt_partition, mtd_list);
++
++		PT_DEBUG("bthub mtd: %s (%x, %x), write(%x), sdram(%x)\n",
++			pt->name, pt->vstart, pt->vsize,
++			(pt->mode & PT_MODE_WRITEABLE),
++			(pt->mode & PT_MODE_INSDRAM));
++#if 0
++		if (pt->mode & PT_MODE_INSDRAM) {
++			int ret;
++
++			pt->mtd = j++;
++
++			ret = register_mtd_device_in_ram(pt->name, (active_partition_address - PT_MEM_BASE) + pt->vstart, pt->vsize);
++
++			PT_DEBUG("register_mtd_device_in_ram() - %d\n", ret);
++			continue;
++		}
++#endif
++		/* Ok, let's make this assumption so far.
++		 * It's true as long as there are no other mtd devices
++		 * having been registered.
++		 *
++		 * Fix me!
++		 */
++		pt->mtd = i + nr_memory;
++		parts[i].offset = pt->vstart - PT_FLASH_START;
++		parts[i].size = pt->vsize;
++		parts[i].name = pt->name;
++
++		if (!(pt->mode & PT_MODE_WRITEABLE))
++			/* mask given flags, i.e. make it non-writeable in our case */
++			parts[i].mask_flags = MTD_WRITEABLE;
++
++		i++;
++	}
++
++        /* Build a tree under /proc. */
++        pt_proc_init();
++
++	/* Setup the rootfs device. */
++//	ROOT_DEV = MKDEV(31, pt_rootfs->mtd);
++	*pparts = parts;
++	return i;
++}
++
++static struct mtd_part_parser bthub_parser = {
++	.owner = THIS_MODULE,
++	.parse_fn = parse_bthub_partitions,
++	.name = "BTHub",
++};
++
++static int __init bthub_parser_init(void)
++{
++	printk("BTHub: initialize parser\n");
++	return register_mtd_parser(&bthub_parser);
++}
++
++static void __exit bthub_parser_exit(void)
++{
++	deregister_mtd_parser(&bthub_parser);
++}
++
++module_init(bthub_parser_init);
++module_exit(bthub_parser_exit);
++
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("dmitry.adamushka@thomson.net");
++MODULE_DESCRIPTION("Support for BTHub flash layout.");
++
