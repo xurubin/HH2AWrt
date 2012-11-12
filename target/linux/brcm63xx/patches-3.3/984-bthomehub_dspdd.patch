@@ -1,0 +1,265 @@
+--- a/arch/mips/bcm63xx/boards/board_bthomehubv2A.c
++++ b/arch/mips/bcm63xx/boards/board_bthomehubv2A.c
+@@ -24,6 +24,7 @@
+ #include <linux/spi/spi_gpio.h>
+ #include <linux/74x594.h>
+ #include <asm/addrspace.h>
++#include <asm/bootinfo.h>
+ #include <bcm63xx_board.h>
+ #include <bcm63xx_cpu.h>
+ #include <bcm63xx_dev_uart.h>
+@@ -39,6 +40,32 @@
+ #include <board_bcm963xx.h>
+ //#include <bcm_tag.h>
+ 
++#define getMemorySize() 0x3F7D000
++#define PT_FLASH_START 0x1E000000
++#define PT_FLASH_SIZE  0x1000000
++
++//#ifdef CONFIG_BCM_ENDPOINT_MODULE
++/*
++ * Defines representing the memory chunks allocated for the DSP module. These values need to match the ones used
++ * in the getDspModSizes.sh script (/cm4/fsn/import/brcm6358/bcmdrivers..., this script checks if the reserved memory is big enough)
++ */
++#define DSP_CORE_SIZE 900000
++#define DSP_INIT_SIZE 5000
++
++/* Pointers to memory buffers allocated for the DSP module */
++void *dsp_core;
++void *dsp_init;
++//EXPORT_SYMBOL(dsp_core);
++//EXPORT_SYMBOL(dsp_init);
++
++void __init allocDspModBuffers(void);
++//#endif /* CONFIG_BCM_ENDPOINT_MODULE */
++
++#define ADSL_RESERVED_MEM (384 * 1024)
++#define PROZONE_RESERVED_MEM (128 * 1024)
++//#define MASTER_POINTER_RESERVED_MEM (4 * 1024) /* 4K because of Linux Page size) */
++#define MASTER_POINTER_RESERVED_MEM (8 * 1024) /* 8K because of Linux Page size) We've move it back to the front */
++
+ #define PFX	"board_homehub: "
+ 
+ #define BTHHV2A_74X594_GPIO_BASE	64
+@@ -381,6 +408,9 @@ void __init board_prom_init(void)
+ 				&bcm63xx_get_fallback_sprom) < 0)
+ 			printk(KERN_ERR PFX "failed to register fallback SPROM\n");
+ 	} */
++
++	add_memory_region(MASTER_POINTER_RESERVED_MEM, getMemorySize(), BOOT_MEM_RAM);
++
+ }
+ 
+ /*
+@@ -473,8 +503,8 @@ int __init board_register_devices(void)
+ 	bcm63xx_spi_register();
+ 
+ 	/* hardcode this for HomeHub */
+-	mtd_resources[0].start = 0x1E000000;
+-	mtd_resources[0].end = 0x1EFFFFFF;
++	mtd_resources[0].start = PT_FLASH_START;
++	mtd_resources[0].end = PT_FLASH_START + PT_FLASH_SIZE - 1;
+ 
+ 	platform_device_register(&mtd_dev);
+ 
+@@ -502,3 +532,31 @@ int __init board_register_devices(void)
+ 
+ 	return 0;
+ }
++
++
++/*
++*****************************************************************************
++** FUNCTION:   allocDspModBuffers
++**
++** PURPOSE:    Allocates buffers for the init and core sections of the DSP
++**             module. This module is special since it has to be allocated
++**             in the 0x800.. memory range which is not mapped by the TLB.
++**
++** PARAMETERS: None
++** RETURNS:    Nothing
++*****************************************************************************
++*/
++void __init allocDspModBuffers(void)
++{
++#ifdef CONFIG_BCM_ENDPOINT_MODULE
++    printk("Allocating memory for DSP module core and initialization code\n");
++
++    dsp_core = (void*)((DSP_CORE_SIZE > 0) ? alloc_bootmem((unsigned long)DSP_CORE_SIZE) : NULL);
++    dsp_init = (void*)((DSP_INIT_SIZE > 0) ? alloc_bootmem((unsigned long)DSP_INIT_SIZE) : NULL);
++
++     printk("Allocated DSP module memory - CORE=0x%x SIZE=%d, INIT=0x%x SIZE=%d\n",
++            (unsigned int)dsp_core, DSP_CORE_SIZE, (unsigned int)dsp_init , DSP_INIT_SIZE);
++#endif
++}
++
++
+--- a/arch/mips/include/asm/mach-bcm63xx/cpu-feature-overrides.h
++++ b/arch/mips/include/asm/mach-bcm63xx/cpu-feature-overrides.h
+@@ -10,11 +10,11 @@
+ #define cpu_has_32fpr			0
+ #define cpu_has_counter			1
+ #define cpu_has_watch			0
+-#define cpu_has_divec			1
++//#define cpu_has_divec			1
+ #define cpu_has_vce			0
+ #define cpu_has_cache_cdex_p		0
+ #define cpu_has_cache_cdex_s		0
+-#define cpu_has_prefetch		1
++//#define cpu_has_prefetch		1
+ #define cpu_has_mcheck			1
+ #define cpu_has_ejtag			1
+ #define cpu_has_llsc			1
+--- a/init/main.c
++++ b/init/main.c
+@@ -114,6 +114,10 @@ EXPORT_SYMBOL(system_state);
+ #define MAX_INIT_ARGS CONFIG_INIT_ENV_ARG_LIMIT
+ #define MAX_INIT_ENVS CONFIG_INIT_ENV_ARG_LIMIT
+ 
++#ifdef CONFIG_BOARD_BTHOMEHUBV20A
++extern void __init allocDspModBuffers(void);
++#endif
++
+ extern void time_init(void);
+ /* Default late time init is NULL. archs can override this later. */
+ void (*__initdata late_time_init)(void);
+@@ -517,6 +521,15 @@ asmlinkage void __init start_kernel(void
+ 	setup_log_buf(0);
+ 	pidhash_init();
+ 	vfs_caches_init_early();
++#ifdef  CONFIG_BOARD_BTHOMEHUBV20A
++        /*
++        ** Allocate boot time memory for the special DSP module. This allocation can be
++        ** possible only before mem_init(). Please ensure that this allocation is performed
++        ** before mem_init().
++        */
++        allocDspModBuffers();
++#endif
++
+ 	sort_main_extable();
+ 	trap_init();
+ 	mm_init();
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -89,6 +89,16 @@
+ /* If this is set, the section belongs in the init part of the module */
+ #define INIT_OFFSET_MASK (1UL << (BITS_PER_LONG-1))
+ 
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++/*
++** These are pointers to memory chunks allocated for the DSP module. The memory is allocate
++** start_kernel() during initialization.
++*/
++extern void *dsp_core;
++extern void *dsp_init;
++#endif /* CONFIG_BOARD_BTHOMEHUBV20A */
++
++
+ /*
+  * Mutex protects:
+  * 1) List of modules (also safely readable with preempt_disable),
+@@ -790,6 +800,11 @@ SYSCALL_DEFINE2(delete_module, const cha
+ 		goto out;
+ 	}
+ 
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++    /* This check is not needed for the DSP module */
++	if ( strcmp(mod->name, "dspdd") != 0 )
++    {
++#endif /* #if defined(CONFIG_BOARD_BTHOMEHUBV20A)  */
+ 	if (!list_empty(&mod->source_list)) {
+ 		/* Other modules depend on us: get rid of them first. */
+ 		ret = -EWOULDBLOCK;
+@@ -826,6 +841,13 @@ SYSCALL_DEFINE2(delete_module, const cha
+ 	/* Never wait if forced. */
+ 	if (!forced && module_refcount(mod) != 0)
+ 		wait_for_zero_refcount(mod);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++	}
++	else
++	{
++		ret = 0;
++	}
++#endif /* #if defined(CONFIG_BOARD_BTHOMEHUBV20A) */
+ 
+ 	mutex_unlock(&module_mutex);
+ 	/* Final destruction now no one is using it. */
+@@ -1792,7 +1814,10 @@ static void free_module(struct module *m
+ 
+ 	/* This may be NULL, but that's OK */
+ 	unset_module_init_ro_nx(mod);
+-	module_free(mod, mod->module_init);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++    if ( strcmp(mod->name, "dspdd") != 0 )
++#endif /* #if defined(CONFIG_BOARD_BTHOMEHUBV20A) */
++    	module_free(mod, mod->module_init);
+ 	kfree(mod->args);
+ 	percpu_modfree(mod);
+ 
+@@ -1801,7 +1826,10 @@ static void free_module(struct module *m
+ 
+ 	/* Finally, free the core (containing the module structure) */
+ 	unset_module_core_ro_nx(mod);
+-	module_free(mod, mod->module_core);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++    if ( strcmp(mod->name, "dspdd") != 0 )
++#endif /* #if defined(CONFIG_BOARD_BTHOMEHUBV20A) */
++    	module_free(mod, mod->module_core);
+ 
+ #ifdef CONFIG_MPU
+ 	update_protections(current->mm);
+@@ -2636,7 +2664,13 @@ static int move_module(struct module *mo
+ 	void *ptr;
+ 
+ 	/* Do the allocs. */
+-	ptr = module_alloc_update_bounds(mod->core_size);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++	if (strcmp(mod->name, "dspdd") == 0) {
++		printk("load dspdd.ko: core_size=%d, init_size=%d\r\n", (int)mod->core_size,  (int)mod->init_size);
++		ptr = mod->core_size ? dsp_core: NULL;
++	} else
++#endif
++		ptr = module_alloc_update_bounds(mod->core_size);
+ 	/*
+ 	 * The pointer to this block is stored in the module structure
+ 	 * which is inside the block. Just mark it as not being a
+@@ -2649,7 +2683,12 @@ static int move_module(struct module *mo
+ 	memset(ptr, 0, mod->core_size);
+ 	mod->module_core = ptr;
+ 
+-	ptr = module_alloc_update_bounds(mod->init_size);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++	if (strcmp(mod->name, "dspdd") == 0) {
++		ptr = mod->init_size ? dsp_init : NULL;
++	} else
++#endif
++		ptr = module_alloc_update_bounds(mod->init_size);
+ 	/*
+ 	 * The pointer to this block is stored in the module structure
+ 	 * which is inside the block. This block doesn't need to be
+@@ -2962,7 +3001,11 @@ static struct module *load_module(void _
+  free_unload:
+ 	module_unload_free(mod);
+  free_module:
+-	module_deallocate(mod, &info);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++	/* Only if not the dsp module */
++	if ( strcmp(mod->name, "dspdd") != 0 )
++#endif /* #if defined(CONFIG_BOARD_BTHOMEHUBV20A) */
++		module_deallocate(mod, &info);
+  free_copy:
+ 	free_copy(&info);
+ 	return ERR_PTR(err);
+@@ -3054,7 +3097,11 @@ SYSCALL_DEFINE3(init_module, void __user
+ 	mod->strtab = mod->core_strtab;
+ #endif
+ 	unset_module_init_ro_nx(mod);
+-	module_free(mod, mod->module_init);
++#if defined(CONFIG_BOARD_BTHOMEHUBV20A)
++	/* Only if not the dsp module */
++	if ( strcmp(mod->name, "dspdd") != 0 )
++#endif /* CONFIG_BOARD_BTHOMEHUBV20A */
++		module_free(mod, mod->module_init);
+ 	mod->module_init = NULL;
+ 	mod->init_size = 0;
+ 	mod->init_ro_size = 0;
